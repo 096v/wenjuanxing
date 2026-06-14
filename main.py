@@ -3,91 +3,60 @@ from selenium import webdriver
 from selenium.webdriver.edge.options import Options as EdgeOptions
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 import random
 import time
 import threading
-import pyautogui
 import yaml
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from proxy_pool import ProxyPool, quick_pool
 
-# 全局锁：pyautogui 不能多线程并发操作鼠标，所有滑块验证必须排队
-PYAUTOGUI_LOCK = threading.Lock()
 
+def solve_slider_backstage(driver, prefix=""):
+    """纯 WebDriver 滑块破解：ActionChains 虚拟拖拽，多线程互不干扰
 
-def get_element_screen_pos(driver, element):
-    """获取元素相对于屏幕的实际坐标"""
-    location = element.location
-    size = element.size
-    browser_pos = driver.get_window_position()
-    
-    # 计算元素中心点的屏幕坐标
-    x = location['x'] + browser_pos['x'] + size['width'] // 2
-    y = location['y'] + browser_pos['y'] + size['height'] // 2 + 80
-    return x, y
-
-def human_drag_trajectory(start_x, start_y, end_x, end_y, duration=None):
-    """模拟人类拖拽轨迹：变速+随机抖动"""
-    if duration is None:
-        duration = random.uniform(1.0, 2.0)
-    
-    steps = int(duration * 50)
-    pyautogui.mouseDown(button='left')
-    time.sleep(random.uniform(0.05, 0.15))
-    
-    for i in range(1, steps + 1):
-        progress = i / steps
-        ease_progress = 1 - (1 - progress) ** 3
-        target_x = start_x + (end_x - start_x) * ease_progress
-        target_y = start_y + (end_y - start_y) * ease_progress
-        jitter_y = random.gauss(0, 1.5)
-        current_x = target_x
-        current_y = target_y + jitter_y
-        pyautogui.moveTo(current_x, current_y)
-        time.sleep(duration / steps)
-    pyautogui.moveTo(end_x - random.randint(1, 3), end_y)
-    time.sleep(random.uniform(0.05, 0.1))
-    pyautogui.moveTo(end_x, end_y)
-    time.sleep(random.uniform(0.05, 0.1))
-    
-    pyautogui.mouseUp(button='left')
-
-def huakuai_improved(driver):
-    """改进版滑块验证：动态坐标+人类轨迹"""
+    核心原理：
+    - ActionChains 直接向浏览器内核发送虚拟坐标事件，不触碰操作系统鼠标
+    - N 个浏览器窗口各自滑动各自的滑块，完全并行，无需互斥锁
+    - 支持 Headless 无头模式（后台静默运行）
+    """
     try:
-        slider_btn = WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, '#rectBottom'))
+        # 兼容新旧版问卷星滑块 ID
+        slider_btn = WebDriverWait(driver, 6).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, '#rectBottom, .nc_itemconfig .nc_bg, #nc_1_n1z')
+            )
         )
-        start_x, start_y = get_element_screen_pos(driver, slider_btn)
-        slider_btn.click()
-        time.sleep(random.uniform(0.3, 0.6))
-        drag_distance = random.randint(280, 380)
-        end_x = start_x + drag_distance
-        end_y = start_y
+        total_distance = random.randint(285, 305)  # 问卷星常见滑动基准像素
 
-        with PYAUTOGUI_LOCK:
-            human_drag_trajectory(start_x, start_y, end_x, end_y)
+        actions = ActionChains(driver)
+        actions.click_and_hold(slider_btn).perform()
 
-        time.sleep(random.uniform(1.0, 2.0))
-        print("滑块验证完成")
+        # 拟人化变速分段滑动（纯内存计算步长，各窗口独立）
+        current_moved = 0
+        while current_moved < total_distance:
+            remaining = total_distance - current_moved
+            if remaining > 100:
+                step = random.randint(15, 35)   # 起步快
+            elif remaining > 30:
+                step = random.randint(8, 15)    # 中途减速
+            else:
+                step = random.randint(1, 4)     # 末端微调，更精细
+
+            # Y 轴加入微小高斯抖动，极度拟人
+            actions.move_by_offset(step, random.choice([-1, 0, 1])).perform()
+            current_moved += step
+            time.sleep(random.uniform(0.015, 0.04))
+
+        actions.release().perform()
+        print(f"{prefix} [验证码] ActionChains 虚拟滑动完成")
+        time.sleep(2)
+        return True
 
     except Exception as e:
-        print(f"滑块验证出错: {e}")
-        huakuai_fallback()
-
-def huakuai_fallback():
-    """降级方案：当无法定位元素时使用固定坐标"""
-    with PYAUTOGUI_LOCK:
-        pyautogui.moveTo(random.randint(494, 496), 791, 0.2)
-        time.sleep(1)
-        pyautogui.dragTo(random.randint(888, 890), 791, 1)
-        time.sleep(1)
-        pyautogui.click(random.randint(652, 667), random.randint(793, 795))
-        time.sleep(1)
-        pyautogui.moveTo(random.randint(494, 496), 791, 0.2)
-        time.sleep(1)
-        pyautogui.dragTo(random.randint(888, 890), 791, 1)
+        print(f"{prefix} [验证码] 滑块未出现或滑动异常: {e}")
+        return False
 
 
 def handle_dropdown(driver, selector):
@@ -253,20 +222,66 @@ def tiankong(driver, num):
         print(f"未找到第 {num} 题的填空题输入框。")
 
 
-def renzheng(driver):
-    wait = WebDriverWait(driver, 10)
+def handle_captcha_and_submit(driver, prefix, submit_selector, success_keyword):
+    """提交 + 验证码 + 成功检测，一体化处理
+
+    对应问卷星提交流程：
+    1. 点击提交按钮
+    2. 检测是否弹出验证码弹窗（智能验证 / 滑块），自动处理
+    3. 轮询检测是否进入成功页面
+
+    Returns:
+        bool: True=提交成功, False=失败
+    """
+    # 1. 点击提交按钮
     try:
-        bth = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR,
-                                                         '#layui-layer1 > div.layui-layer-btn.layui-layer-btn- > a.layui-layer-btn0')))
-        bth.click()
-        time.sleep(random.uniform(0.8, 1.5))
-        rectBottom = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, '#rectBottom')))
-        rectBottom.click()
-        time.sleep(random.uniform(1.5, 2.5))
-        # 使用改进版滑块验证
-        huakuai_improved(driver)
-    except TimeoutException:
-        print("本次未出现认证界面，继续进行后续操作")
+        submit_btn = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, submit_selector))
+        )
+        driver.execute_script("arguments[0].click();", submit_btn)
+        print(f"{prefix} 已点击提交按钮")
+    except Exception as e:
+        print(f"{prefix} ❌ 无法点击提交按钮: {e}")
+        return False
+
+    # 2. 轮询检测验证码弹窗（智能验证按钮 / 滑块）
+    time.sleep(1)
+    verify_selectors = [
+        '#layui-layer1 .layui-layer-btn0',
+        '.layui-layer-btn0',
+        '#divVerifyBox',
+        '#SM_TXT_1',
+    ]
+    for selector in verify_selectors:
+        try:
+            btn = driver.find_element(By.CSS_SELECTOR, selector)
+            if btn.is_displayed():
+                driver.execute_script("arguments[0].click();", btn)
+                print(f"{prefix} 发现验证弹窗，已自动点击解锁...")
+                time.sleep(1.5)
+                # 触发 ActionChains 滑块破解
+                solve_slider_backstage(driver, prefix)
+                break
+        except Exception:
+            continue
+
+    # 3. 校验最终是否提交成功（最多轮询 15 秒）
+    success_conditions = [
+        (By.XPATH, f'//*[contains(text(), "{success_keyword}")]'),
+        (By.CSS_SELECTOR, '#divdsc'),
+        (By.XPATH, '//*[contains(text(), "感谢您的参与")]'),
+    ]
+
+    for _ in range(15):
+        for method, locator in success_conditions:
+            try:
+                if driver.find_element(method, locator).is_displayed():
+                    return True
+            except Exception:
+                continue
+        time.sleep(1)
+
+    return False
 
 
 def gundong(driver, distance):
@@ -345,6 +360,8 @@ def _build_edge_driver(proxy=None):
     option.add_argument('--no-sandbox')
     option.add_argument('--disable-dev-shm-usage')
     option.add_argument("--disable-infobars")
+    # 无头模式：取消下一行注释即可全后台静默运行，不弹窗口，极省资源
+    # option.add_argument('--headless=new')
     option.add_argument(f'user-agent={random.choice(user_agents)}')
 
     # ========== 代理配置 ==========
@@ -423,23 +440,16 @@ def run_single_task(times, config_path="survey_config.yaml", proxy=None, task_id
 
         execute_survey_from_yaml(driver, config)
 
-        try:
-            WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, submit_selector)))
-            driver.find_element(By.CSS_SELECTOR, submit_selector).click()
-        except TimeoutException:
-            print(f"{prefix} 未找到下一步按钮，可能页面加载异常。")
-
-        # 滑块验证（pyautogui 已内部加锁，多线程安全）
-        renzheng(driver)
-
-        try:
-            success_xpath = f'//div[@id="divdsc" and contains(text(), "{success_keyword}")]'
-            WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.XPATH, success_xpath))
-            )
+        # 提交 + 验证码 + 成功检测（纯 WebDriver，多线程安全）
+        is_ok = handle_captcha_and_submit(driver, prefix, submit_selector, success_keyword)
+        if is_ok:
             print(f'{prefix} ✅ 问卷提交成功！')
-        except TimeoutException:
-            print(f'{prefix} ⚠️ 未检测到提交成功提示')
+        else:
+            print(f'{prefix} ⚠️ 未检测到提交成功提示，尝试截图...')
+            try:
+                driver.save_screenshot(f"error_task{task_id}_{i+1}_{int(time.time())}.png")
+            except Exception:
+                pass
 
         print(f'{prefix} 已完成 {i+1}/{times} 次')
         driver.quit()
