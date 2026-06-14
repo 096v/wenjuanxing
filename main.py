@@ -6,8 +6,14 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 import random
 import time
+import threading
 import pyautogui
 import yaml
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from proxy_pool import ProxyPool, quick_pool
+
+# 全局锁：pyautogui 不能多线程并发操作鼠标，所有滑块验证必须排队
+PYAUTOGUI_LOCK = threading.Lock()
 
 
 def get_element_screen_pos(driver, element):
@@ -59,26 +65,29 @@ def huakuai_improved(driver):
         drag_distance = random.randint(280, 380)
         end_x = start_x + drag_distance
         end_y = start_y
-        human_drag_trajectory(start_x, start_y, end_x, end_y)
-        
+
+        with PYAUTOGUI_LOCK:
+            human_drag_trajectory(start_x, start_y, end_x, end_y)
+
         time.sleep(random.uniform(1.0, 2.0))
         print("滑块验证完成")
-        
+
     except Exception as e:
         print(f"滑块验证出错: {e}")
         huakuai_fallback()
 
 def huakuai_fallback():
     """降级方案：当无法定位元素时使用固定坐标"""
-    pyautogui.moveTo(random.randint(494, 496), 791, 0.2)
-    time.sleep(1)
-    pyautogui.dragTo(random.randint(888, 890), 791, 1)
-    time.sleep(1)
-    pyautogui.click(random.randint(652, 667), random.randint(793, 795))
-    time.sleep(1)
-    pyautogui.moveTo(random.randint(494, 496), 791, 0.2)
-    time.sleep(1)
-    pyautogui.dragTo(random.randint(888, 890), 791, 1)
+    with PYAUTOGUI_LOCK:
+        pyautogui.moveTo(random.randint(494, 496), 791, 0.2)
+        time.sleep(1)
+        pyautogui.dragTo(random.randint(888, 890), 791, 1)
+        time.sleep(1)
+        pyautogui.click(random.randint(652, 667), random.randint(793, 795))
+        time.sleep(1)
+        pyautogui.moveTo(random.randint(494, 496), 791, 0.2)
+        time.sleep(1)
+        pyautogui.dragTo(random.randint(888, 890), 791, 1)
 
 
 def handle_dropdown(driver, selector):
@@ -284,15 +293,15 @@ def execute_survey_from_yaml(driver, config_data):
         time.sleep(random.uniform(0.5, 1.2))
 
 
-def zonghe(times, config_path="survey_config.yaml"):
-    # 加载 YAML 配置
-    config = load_config(config_path)
-    settings = config.get('settings', {})
-    url_survey = settings.get('url', 'https://v.wjx.cn/vm/PyKgkYl.aspx#')
-    submit_selector = settings.get('submit_selector', '#ctlNext')
-    success_keyword = settings.get('success_keyword', '您的答卷已经提交')
+def _build_edge_driver(proxy=None):
+    """创建配置好的 Edge 浏览器实例
 
-    # User-Agent池，每次使用不同的标识
+    Args:
+        proxy: 代理字符串，如 "66.29.154.103:3128"，None 则直连
+
+    Returns:
+        webdriver.Edge
+    """
     user_agents = [
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
@@ -300,75 +309,89 @@ def zonghe(times, config_path="survey_config.yaml"):
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     ]
 
-    for i in range(0, times):
-        
-        # 使用 Edge 浏览器（Windows 自带，无需安装）
-        option = EdgeOptions()
-        option.add_experimental_option('excludeSwitches', ['enable-automation'])
-        option.add_experimental_option('useAutomationExtension', False)
-        option.add_argument("--disable-blink-features=AutomationControlled")
-        option.add_argument('--disable-extensions')
-        option.add_argument('--no-sandbox')
-        option.add_argument('--disable-dev-shm-usage')
-        option.add_argument("--disable-infobars")  # 禁用信息栏
+    option = EdgeOptions()
+    option.add_experimental_option('excludeSwitches', ['enable-automation'])
+    option.add_experimental_option('useAutomationExtension', False)
+    option.add_argument("--disable-blink-features=AutomationControlled")
+    option.add_argument('--disable-extensions')
+    option.add_argument('--no-sandbox')
+    option.add_argument('--disable-dev-shm-usage')
+    option.add_argument("--disable-infobars")
+    option.add_argument(f'user-agent={random.choice(user_agents)}')
 
-        option.add_argument(f'user-agent={random.choice(user_agents)}')
-        
-        driver = webdriver.Edge(options=option)
+    # ========== 代理配置 ==========
+    if proxy:
+        option.add_argument(f'--proxy-server=http://{proxy}')
+        print(f"    使用代理: {proxy}")
 
-        driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument',
-                               {'source': 'Object.defineProperty(navigator, "webdriver", {get: () => undefined})'})
-        width = random.randint(1000, 1400)
-        height = random.randint(800, 1000)
-        driver.set_window_size(width, height)
+    driver = webdriver.Edge(options=option)
 
+    # 隐藏webdriver属性
+    driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument',
+                           {'source': 'Object.defineProperty(navigator, "webdriver", {get: () => undefined})'})
+
+    # 随机窗口大小
+    width = random.randint(1000, 1400)
+    height = random.randint(800, 1000)
+    driver.set_window_size(width, height)
+
+    return driver
+
+
+def run_single_task(times, config_path="survey_config.yaml", proxy=None, task_id=1):
+    """单个任务：完成 times 次问卷提交
+
+    Args:
+        times: 该任务提交次数
+        config_path: YAML 配置文件路径
+        proxy: 代理字符串，如 "66.29.154.103:3128"（None 则直连）
+        task_id: 任务编号（多线程时用于日志区分）
+    """
+    prefix = f"[任务-{task_id}]"
+
+    config = load_config(config_path)
+    settings = config.get('settings', {})
+    url_survey = settings.get('url', 'https://v.wjx.cn/vm/PyKgkYl.aspx#')
+    submit_selector = settings.get('submit_selector', '#ctlNext')
+    success_keyword = settings.get('success_keyword', '您的答卷已经提交')
+
+    print(f"{prefix} 启动: 共 {times} 次, 代理={proxy or '直连'}")
+
+    for i in range(times):
+        print(f"{prefix} 第 {i+1}/{times} 次开始...")
+
+        driver = _build_edge_driver(proxy=proxy)
+
+        # 随机延迟后再开始
         time.sleep(random.uniform(2, 5))
 
         driver.get(url_survey)
 
+        # 等待页面完全加载
         page_loaded = False
         for selector in ['#div1', '.ui-controlgroup', '[id^="q"]', '.field-ui']:
             try:
                 WebDriverWait(driver, 5).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, selector))
                 )
-                print(f"页面加载完成（检测到 {selector}）")
+                print(f"{prefix} 页面加载完成（检测到 {selector}）")
                 page_loaded = True
                 break
             except TimeoutException:
                 continue
-        
+
         if not page_loaded:
-            print("警告：未检测到标准题目元素，尝试继续执行...")
-        
-        time.sleep(3)  # 额外等待JavaScript渲染
-        
-        # 调试：打印页面中所有可能的题目相关元素
+            print(f"{prefix} 警告：未检测到标准题目元素，尝试继续执行...")
+
+        time.sleep(3)
+
+        # 快速调试（仅在首次或出错时详细输出）
         try:
-            # 尝试查找常见的问卷星题目容器
-            possible_selectors = [
-                "div[id^='div'][class*='control']",
-                "div.ui-controlgroup",
-                "div.field-ui",
-                "div[class*='question']",
-            ]
-            
-            found_elements = []
-            for selector in possible_selectors:
-                elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                if elements:
-                    found_elements.append(f"{selector}: 找到 {len(elements)} 个")
-            
-            if found_elements:
-                print(f"检测到的题目容器: {found_elements}")
-            else:
-                print("未找到标准题目容器，尝试通用选择器...")
-                # 打印所有包含 'radio' 或 'checkbox' 的元素
-                radios = driver.find_elements(By.CSS_SELECTOR, '.ui-radio')
-                checkboxes = driver.find_elements(By.CSS_SELECTOR, '.ui-checkbox')
-                print(f"单选按钮: {len(radios)} 个, 多选按钮: {len(checkboxes)} 个")
-        except Exception as e:
-            print(f"调试信息获取失败: {e}")
+            radios = driver.find_elements(By.CSS_SELECTOR, '.ui-radio')
+            checkboxes = driver.find_elements(By.CSS_SELECTOR, '.ui-checkbox')
+            print(f"{prefix} 检测到单选:{len(radios)} 多选:{len(checkboxes)}")
+        except Exception:
+            pass
 
         execute_survey_from_yaml(driver, config)
 
@@ -376,28 +399,123 @@ def zonghe(times, config_path="survey_config.yaml"):
             WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, submit_selector)))
             driver.find_element(By.CSS_SELECTOR, submit_selector).click()
         except TimeoutException:
-            print("未找到下一步按钮，可能页面加载异常。")
+            print(f"{prefix} 未找到下一步按钮，可能页面加载异常。")
 
+        # 滑块验证（pyautogui 已内部加锁，多线程安全）
         renzheng(driver)
 
         try:
             success_xpath = f'//div[@id="divdsc" and contains(text(), "{success_keyword}")]'
-            success_msg = WebDriverWait(driver, 10).until(
+            WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.XPATH, success_xpath))
             )
-            if success_msg:
-                print('问卷提交成功！')
+            print(f'{prefix} ✅ 问卷提交成功！')
         except TimeoutException:
-            print('未检测到提交成功提示，可能出现问题。')
+            print(f'{prefix} ⚠️ 未检测到提交成功提示')
 
-        print(f'已经提交了{i + 1}次问卷')
+        print(f'{prefix} 已完成 {i+1}/{times} 次')
         driver.quit()
 
+        # 每次提交后随机间隔
         if i < times - 1:
             wait_time = random.randint(10, 30)
-            print(f'等待 {wait_time} 秒后继续下一次提交...')
+            print(f'{prefix} 等待 {wait_time}s ...')
             time.sleep(wait_time)
+
+    print(f"{prefix} 🏁 全部完成！共提交 {times} 次")
+
+
+def run_concurrent(total_times, config_path="survey_config.yaml", thread_count=3,
+                   fetch_proxy="127.0.0.1:7897", proxy_count=5):
+    """多线程并发执行问卷任务
+
+    Args:
+        total_times: 总提交次数（会均匀分配到各线程）
+        config_path: YAML 配置文件路径
+        thread_count: 并发线程数
+        fetch_proxy: 抓取代理时用的代理（翻墙用），None 则不抓取在线代理
+        proxy_count: 目标可用代理数
+    """
+    print(f"\n{'='*60}")
+    print(f"🚀 多线程模式启动")
+    print(f"   总次数: {total_times} | 线程数: {thread_count} | 代理目标: {proxy_count}")
+    print(f"{'='*60}\n")
+
+    # 1. 获取代理池
+    proxy_list = []
+    if fetch_proxy:
+        try:
+            pool = quick_pool(fetch_proxy=fetch_proxy, target_count=proxy_count)
+            proxy_list = pool.get_unique_proxies(thread_count)
+            print(f"[主线程] 获取到 {len(proxy_list)} 个代理\n")
+        except Exception as e:
+            print(f"[主线程] 代理池初始化失败: {e}，将使用直连模式\n")
+    else:
+        print("[主线程] 未配置代理抓取通道，使用直连模式\n")
+
+    # 2. 分配任务：每个线程提交次数
+    per_thread = [total_times // thread_count] * thread_count
+    for i in range(total_times % thread_count):
+        per_thread[i] += 1
+
+    print(f"[主线程] 任务分配: {per_thread}\n")
+
+    # 3. 并发执行
+    results = []
+    with ThreadPoolExecutor(max_workers=thread_count) as executor:
+        futures = {}
+        for tid in range(thread_count):
+            proxy = proxy_list[tid] if tid < len(proxy_list) else None
+            futures[executor.submit(
+                run_single_task,
+                times=per_thread[tid],
+                config_path=config_path,
+                proxy=proxy,
+                task_id=tid + 1
+            )] = tid + 1
+
+        for future in as_completed(futures):
+            tid = futures[future]
+            try:
+                future.result()
+                results.append((tid, True))
+            except Exception as e:
+                print(f"[任务-{tid}] ❌ 异常: {e}")
+                results.append((tid, False))
+
+    # 4. 汇总
+    success = sum(1 for _, ok in results if ok)
+    print(f"\n{'='*60}")
+    print(f"🏁 全部任务完成！成功 {success}/{len(results)} 个线程")
+    print(f"{'='*60}\n")
+
+
+# 保留旧函数名作为兼容别名
+def zonghe(times, config_path="survey_config.yaml"):
+    """兼容旧接口：单线程顺序执行，不使用代理"""
+    run_single_task(times, config_path=config_path, proxy=None, task_id=1)
 
 
 if __name__ == "__main__":
-    zonghe(1, "survey_config.yaml")
+    import sys
+
+    # 默认：多线程模式，3 线程，共提交 10 次
+    # 用法：
+    #   python main.py                      → 多线程模式（3线程，10次）
+    #   python main.py single               → 单线程模式（1次，兼容旧版）
+    #   python main.py single 5             → 单线程模式（5次）
+    #   python main.py multi 20 5           → 多线程模式（5线程，总20次）
+
+    if len(sys.argv) > 1 and sys.argv[1] == "single":
+        times = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+        zonghe(times, "survey_config.yaml")
+    else:
+        total = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 10
+        threads = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 3
+        run_concurrent(
+            total_times=total,
+            config_path="survey_config.yaml",
+            thread_count=threads,
+            fetch_proxy="127.0.0.1:7897",  # 本地代理：用于翻墙抓取在线代理列表
+            proxy_count=5,                  # 目标获取 5 个可用代理
+        )
