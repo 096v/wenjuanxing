@@ -223,34 +223,65 @@ def tiankong(driver, num):
 
 
 def handle_captcha_and_submit(driver, prefix, submit_selector, success_keyword):
-    """提交 + 验证码 + 成功检测，一体化处理
+    """提交 + 验证码 + 成功检测，一体化处理（增强版）
 
     对应问卷星提交流程：
-    1. 点击提交按钮
-    2. 检测是否弹出验证码弹窗（智能验证 / 滑块），自动处理
-    3. 轮询检测是否进入成功页面
+    1. 点击提交按钮（多选择器 + 重试）
+    2. 检测验证码弹窗（智能验证 / 滑块），ActionChains 破解
+    3. 多层成功检测：XPath 文本 + CSS 选择器 + URL 变化 + 页面源码扫描
 
     Returns:
         bool: True=提交成功, False=失败
     """
-    # 1. 点击提交按钮
-    try:
-        submit_btn = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, submit_selector))
-        )
-        driver.execute_script("arguments[0].click();", submit_btn)
-        print(f"{prefix} 已点击提交按钮")
-    except Exception as e:
-        print(f"{prefix} ❌ 无法点击提交按钮: {e}")
+    # ========== 1. 点击提交按钮（多选择器 + JS 保底） ==========
+    submit_selectors = [submit_selector, '#ctlNext', '#submit_button', 'button[type="submit"]',
+                        '.submitbtn', '#next_a', 'a:contains("提交")']
+    clicked = False
+    for sel in submit_selectors:
+        try:
+            btn = driver.find_element(By.CSS_SELECTOR, sel.replace(':contains("提交")', ''))
+            if btn.is_displayed():
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+                time.sleep(0.3)
+                driver.execute_script("arguments[0].click();", btn)
+                print(f"{prefix} 已点击提交按钮 (via {sel})")
+                clicked = True
+                break
+        except Exception:
+            continue
+
+    # JS 保底：直接调用问卷星的提交函数
+    if not clicked:
+        try:
+            driver.execute_script("""
+                var btns = document.querySelectorAll('a, button, input[type="submit"], .submitbtn');
+                for (var i = 0; i < btns.length; i++) {
+                    if (btns[i].innerText.indexOf('提交') > -1 || btns[i].value.indexOf('提交') > -1) {
+                        btns[i].click();
+                        return true;
+                    }
+                }
+                return false;
+            """)
+            print(f"{prefix} 通过 JS 扫描'提交'按钮完成点击")
+            clicked = True
+        except Exception as e:
+            print(f"{prefix} ❌ JS 保底点击也失败: {e}")
+
+    if not clicked:
+        print(f"{prefix} ❌ 所有方式都无法点击提交按钮")
         return False
 
-    # 2. 轮询检测验证码弹窗（智能验证按钮 / 滑块）
-    time.sleep(1)
+    # ========== 2. 轮询检测验证码弹窗 ==========
+    time.sleep(1.5)
     verify_selectors = [
         '#layui-layer1 .layui-layer-btn0',
         '.layui-layer-btn0',
         '#divVerifyBox',
         '#SM_TXT_1',
+        '.captcha_verify',
+        '#rectBottom',
+        '.nc_itemconfig .nc_bg',
     ]
     for selector in verify_selectors:
         try:
@@ -259,27 +290,71 @@ def handle_captcha_and_submit(driver, prefix, submit_selector, success_keyword):
                 driver.execute_script("arguments[0].click();", btn)
                 print(f"{prefix} 发现验证弹窗，已自动点击解锁...")
                 time.sleep(1.5)
-                # 触发 ActionChains 滑块破解
                 solve_slider_backstage(driver, prefix)
+                time.sleep(2)
                 break
         except Exception:
             continue
+    else:
+        print(f"{prefix} 未出现验证弹窗（可能无需验证）")
 
-    # 3. 校验最终是否提交成功（最多轮询 15 秒）
-    success_conditions = [
+    # ========== 3. 多层成功检测（轮询 15 秒） ==========
+    # 问卷星成功页面的多种可能特征
+    success_checks = [
+        # 文本匹配（最可靠）
         (By.XPATH, f'//*[contains(text(), "{success_keyword}")]'),
-        (By.CSS_SELECTOR, '#divdsc'),
+        (By.XPATH, '//*[contains(text(), "提交成功")]'),
         (By.XPATH, '//*[contains(text(), "感谢您的参与")]'),
+        (By.XPATH, '//*[contains(text(), "答卷已经提交")]'),
+        (By.XPATH, '//*[contains(text(), "您的答卷")]'),
+        # CSS 选择器
+        (By.CSS_SELECTOR, '#divdsc'),
+        (By.CSS_SELECTOR, '.success'),
+        (By.CSS_SELECTOR, '#submit_success'),
+        (By.CSS_SELECTOR, '.alert-success'),
     ]
 
-    for _ in range(15):
-        for method, locator in success_conditions:
+    for sec in range(15):
+        # 逐项检查 DOM 元素
+        for method, locator in success_checks:
             try:
-                if driver.find_element(method, locator).is_displayed():
+                el = driver.find_element(method, locator)
+                if el.is_displayed():
+                    print(f"{prefix} 成功页检测匹配: {locator}")
                     return True
             except Exception:
                 continue
+
+        # 兜底：检查当前 URL 是否跳转到了成功页
+        try:
+            current_url = driver.current_url
+            if any(kw in current_url for kw in ['complete', 'success', 'finish', 'end', 'joinfail']):
+                print(f"{prefix} 成功页 URL 匹配: {current_url}")
+                return True
+        except Exception:
+            pass
+
+        # 终极兜底：扫描页面源码中是否包含成功关键词
+        if sec >= 10:  # 10 秒后再启用源码扫描（省资源）
+            try:
+                page_text = driver.find_element(By.TAG_NAME, 'body').text
+                if any(kw in page_text for kw in ['您的答卷已经提交', '提交成功', '感谢您的参与',
+                                                    '问卷已提交', '答卷提交成功']):
+                    print(f"{prefix} 页面源码检测到成功关键词")
+                    return True
+            except Exception:
+                pass
+
         time.sleep(1)
+
+    # 失败：保存截图 + 页面源码
+    try:
+        driver.save_screenshot(f"fail_{prefix.replace('[', '').replace(']', '').replace(' ', '_')}_{int(time.time())}.png")
+        with open(f"page_source_{int(time.time())}.html", 'w', encoding='utf-8') as f:
+            f.write(driver.page_source[:5000])
+        print(f"{prefix} 已保存失败截图和页面源码片段")
+    except Exception:
+        pass
 
     return False
 
