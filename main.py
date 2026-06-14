@@ -54,8 +54,11 @@ def solve_slider_backstage(driver, prefix=""):
         time.sleep(2)
         return True
 
+    except TimeoutException:
+        print(f"{prefix} [验证码] 滑块元素未找到（可能无需滑块验证）")
+        return False
     except Exception as e:
-        print(f"{prefix} [验证码] 滑块未出现或滑动异常: {e}")
+        print(f"{prefix} [验证码] 滑块异常 [{type(e).__name__}]: {e}")
         return False
 
 
@@ -132,7 +135,7 @@ def handle_dropdown(driver, selector):
             raise NoSuchElementException("未找到可点击的下拉候选菜单项")
 
     except Exception as e:
-        print(f" ❌ {selector} 下拉框所有方法均失效，请检查页面结构: {e}")
+        print(f" ❌ {selector} 下拉框所有方法均失效 [{type(e).__name__}]: {e}")
 
 
 def handle_matrix(driver, selector):
@@ -152,7 +155,7 @@ def handle_matrix(driver, selector):
                 time.sleep(random.uniform(0.2, 0.4))
         print(f" {selector} 矩阵题处理完成")
     except Exception as e:
-        print(f" {selector} 矩阵题处理失败: {e}")
+        print(f" {selector} 矩阵题处理失败 [{type(e).__name__}]: {e}")
 
 
 def handle_sort_question(driver, selector):
@@ -175,7 +178,7 @@ def handle_sort_question(driver, selector):
                 time.sleep(random.uniform(0.4, 0.7))
             print(f" {selector} 排序题（全选乱序）完成")
     except Exception as e:
-        print(f" {selector} 排序题处理失败: {e}")
+        print(f" {selector} 排序题处理失败 [{type(e).__name__}]: {e}")
 
 
 def handle_question(driver, selector, answer_type='radio', valid_ans_count=1):
@@ -195,7 +198,7 @@ def handle_question(driver, selector, answer_type='radio', valid_ans_count=1):
                 time.sleep(0.3)
             print(f" {selector} 处理成功")
     except Exception as e:
-        print(f" {selector} 跳过: {e}")
+        print(f" {selector} 跳过 [{type(e).__name__}]: {e}")
 
 
 def scroll_to_element(driver, element):
@@ -203,6 +206,7 @@ def scroll_to_element(driver, element):
 
 
 def tiankong(driver, num):
+    """填空题：多选择器兼容查找输入框"""
     answers_pool = [
         "无", "好", "good", "不错", "还可以", "满意", "挺好",
         "暂无", "没有", "不清楚", "一般般", "还行吧", "挺好的",
@@ -212,14 +216,39 @@ def tiankong(driver, num):
         "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
         "是", "否", "对", "错", "有", "没有"
     ]
-    try:
-        input_element = driver.find_element(By.CSS_SELECTOR, f'#q{num}')
-        if random.random() > 0.1:
-            answer = random.choice(answers_pool)
-            input_element.send_keys(answer)
-            time.sleep(random.uniform(0.3, 0.8))
-    except NoSuchElementException:
-        print(f"未找到第 {num} 题的填空题输入框。")
+
+    # 多维选择器：兼容问卷星不同模板的 input ID 命名
+    num_str = str(num)
+    selectors = [
+        f'#q{num_str}',
+        f'#select_q{num_str}',
+        f'input[id*="q{num_str}"]',
+        f'textarea[id*="q{num_str}"]',
+        f'input[name*="q{num_str}"]',
+        f'textarea[name*="q{num_str}"]',
+        f'.ui-input[id*="q{num_str}"]',
+    ]
+
+    input_element = None
+    for sel in selectors:
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, sel)
+            if el.is_displayed() and el.is_enabled():
+                input_element = el
+                break
+        except Exception:
+            continue
+
+    if input_element is None:
+        print(f"未找到第 {num} 题的填空输入框（已尝试 {len(selectors)} 种选择器）")
+        return
+
+    if random.random() > 0.1:  # 90% 概率填写
+        input_element.clear()
+        answer = random.choice(answers_pool)
+        input_element.send_keys(answer)
+        time.sleep(random.uniform(0.3, 0.8))
+        print(f" 填空题 q{num}={answer}")
 
 
 def handle_captcha_and_submit(driver, prefix, submit_selector, success_keyword):
