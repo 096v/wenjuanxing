@@ -91,28 +91,44 @@ def huakuai_fallback():
 
 
 def handle_dropdown(driver, selector):
-    """针对第1题下拉框：JS 注入强制选择法"""
+    """优化版下拉框处理：增强型 JS 注入 + 稳健降级"""
     try:
-        q_box = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", q_box)
-        time.sleep(0.5)
-        q_id = selector.replace('#div', 'q')
+        # 1. 显式等待题目容器加载
+        q_box = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+        )
+
+        # 2. 平滑滚动到视野中心，并等待让前端组件渲染完毕
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center', behavior: 'smooth'});", q_box)
+        time.sleep(random.uniform(0.5, 0.8))
+
+        # 从 #div1 提取出数字 1
+        q_num = selector.replace('#div', '')
+
+        # 3. 增强版 JS 注入：同时尝试多种可能的 select 标签定位方式
         js_code = f"""
-        var selectEl = document.querySelector('{q_id}');
+        // 尝试匹配 q1, select_q1 或者是 div1 下的 select 元素
+        var selectEl = document.getElementById('q{q_num}') ||
+                       document.getElementById('select_q{q_num}') ||
+                       document.querySelector('{selector} select');
+
         if (selectEl) {{
             var options = selectEl.options;
             var validIndices = [];
             for (var i = 0; i < options.length; i++) {{
-                if (options[i].value && options[i].value !== "0" && options[i].text.indexOf("请选择") === -1) {{
+                var text = options[i].text;
+                var val = options[i].value;
+                // 过滤掉提示语、空值或带有"请选择"的选项
+                if (val && val !== "0" && text.indexOf("请选择") === -1 && text.trim() !== "") {{
                     validIndices.push(i);
                 }}
             }}
             if (validIndices.length > 0) {{
                 var randomIndex = validIndices[Math.floor(Math.random() * validIndices.length)];
                 selectEl.selectedIndex = randomIndex;
-                // 触发原生 change 事件
+
+                // 触发 change 事件通知前端框架更新数据
                 selectEl.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                // 如果页面使用了 Select2，还需要触发它的 change
                 if (window.jQuery && jQuery(selectEl).data('select2')) {{
                     jQuery(selectEl).trigger('change');
                 }}
@@ -122,20 +138,32 @@ def handle_dropdown(driver, selector):
         return null;
         """
         result = driver.execute_script(js_code)
-        
+
         if result:
-            print(f" {selector} 通过 JS 强制选择成功: {result}")
+            print(f" {selector} 通过 JS 强选成功: 【{result}】")
+            return
+
+        # 4. 如果 JS 注入彻底失败，使用 Selenium 原生 DOM 点击保底（比 PyAutoGUI 按键更安全）
+        print(f"⚠️ {selector} JS 注入未能选中，切换到原生 DOM 点击保底")
+
+        # 寻找问卷星下拉框的视觉触发框
+        trigger = q_box.find_element(By.CSS_SELECTOR, ".select2-selection, .ui-select, [class*='select']")
+        driver.execute_script("arguments[0].click();", trigger)
+        time.sleep(0.5)
+
+        # 寻找弹出的下拉框选项列表
+        options = driver.find_elements(By.CSS_SELECTOR, ".select2-results__option, dd, li")
+        valid_options = [o for o in options if o.is_displayed() and "请选择" not in o.text and o.text.strip()]
+
+        if valid_options:
+            target_opt = random.choice(valid_options)
+            driver.execute_script("arguments[0].click();", target_opt)
+            print(f" {selector} 通过 DOM 保底点击成功: 【{target_opt.text.strip()}】")
         else:
-            print(f"️ {selector} JS 注入失败，尝试最后的物理保底")
-            trigger = q_box.find_element(By.CSS_SELECTOR, ".select2-selection, .ui-select")
-            trigger.click()
-            time.sleep(0.8)
-            pyautogui.press('down')
-            time.sleep(0.2)
-            pyautogui.press('enter')
-            
+            raise NoSuchElementException("未找到可点击的下拉候选菜单项")
+
     except Exception as e:
-        print(f" {selector} 下拉框所有方法均失效: {e}")
+        print(f" ❌ {selector} 下拉框所有方法均失效，请检查页面结构: {e}")
 
 
 def handle_matrix(driver, selector):
